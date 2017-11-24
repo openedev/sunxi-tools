@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <zlib.h>
 #include <sys/stat.h>
 
 static bool verbose = false; /* If set, makes the 'fel' tool more talkative */
@@ -737,10 +738,21 @@ void aw_fel_write_and_execute_spl(feldev_handle *dev, uint8_t *buf, size_t len)
  */
 void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf, size_t len)
 {
+	uint32_t hdr[HEADER_SIZE / 4];
+
 	if (len <= HEADER_SIZE)
 		return; /* Insufficient size (no actual data), just bail out */
 
 	uint32_t *buf32 = (uint32_t *)buf;
+
+	memcpy(hdr, buf32, HEADER_SIZE);
+
+	uint32_t hcrc = be32toh(hdr[1]);
+	hdr[1] = 0;
+	uint32_t computed_hcrc = crc32(0, (const uint8_t *) &hdr, HEADER_SIZE);
+	if (hcrc != computed_hcrc)
+		pr_fatal("U-Boot header CRC mismatch: expected %x, got %x\n",
+			 hcrc, computed_hcrc);
 
 	/* Check for a valid mkimage header */
 	int image_type = get_image_type(buf, len);
@@ -764,21 +776,18 @@ void aw_fel_write_uboot_image(feldev_handle *dev, uint8_t *buf, size_t len)
 
 	uint32_t data_size = be32toh(buf32[3]); /* Image Data Size */
 	uint32_t load_addr = be32toh(buf32[4]); /* Data Load Address */
-	if (data_size != len - HEADER_SIZE)
-		pr_fatal("U-Boot image data size mismatch: "
-			 "expected %zu, got %u\n", len - HEADER_SIZE, data_size);
+	if (data_size > len - HEADER_SIZE)
+		pr_fatal("U-Boot image data trucated: "
+			 "expected %zu bytes, got %u\n",
+			 len - HEADER_SIZE, data_size);
 
-	/* TODO: Verify image data integrity using the checksum field ih_dcrc,
-	 * available from be32toh(buf32[6])
-	 *
-	 * However, this requires CRC routines that mimic their U-Boot
-	 * counterparts, namely image_check_dcrc() in ${U-BOOT}/common/image.c
-	 * and crc_wd() in ${U-BOOT}/lib/crc32.c
-	 *
-	 * It should be investigated if existing CRC routines in sunxi-tools
-	 * could be factored out and reused for this purpose - e.g. calc_crc32()
-	 * from nand-part-main.c
-	 */
+	uint32_t dcrc = be32toh(buf32[6]);
+	uint32_t computed_dcrc = crc32(0,
+				       ((const uint8_t *) buf32) + HEADER_SIZE,
+				       data_size);
+	if (dcrc != computed_dcrc)
+		pr_fatal("U-Boot data CRC mismatch: expected %x, got %x\n",
+			 dcrc, computed_dcrc);
 
 	/* If we get here, we're "good to go" (i.e. actually write the data) */
 	pr_info("Writing image \"%.*s\", %u bytes @ 0x%08X.\n",
